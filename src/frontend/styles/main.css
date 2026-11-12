@@ -1680,12 +1680,7 @@ body::before {
 }
 
 .outbound-latency {
-    display: flex;
-    flex-direction: column;
-    gap: 7px;
     margin-top: 8px;
-    padding-top: 8px;
-    border-top: 1px dashed var(--border-color);
 }
 
 .outbound-latency-caption,
@@ -1695,6 +1690,13 @@ body::before {
     font-weight: 600;
     letter-spacing: 0.02em;
     text-transform: none;
+}
+
+/* One slot of the real 5-minute grid. flex-grow stays off so two samples cannot stretch into wide blocks. */
+.outbound-latency .three-net-bucket {
+    flex: 0 0 auto;
+    width: calc((100% - (var(--outbound-slots, 24) - 1) * 2px) / var(--outbound-slots, 24));
+    max-width: calc((100% - (var(--outbound-slots, 24) - 1) * 2px) / var(--outbound-slots, 24));
 }
 
 .three-net-columns {
