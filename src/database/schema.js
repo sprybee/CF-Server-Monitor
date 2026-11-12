@@ -137,10 +137,6 @@ export async function clearHistory(db) {
     await db.prepare(`DROP TABLE IF EXISTS metrics_history_old`).run();
     debug('✅ 已删除 metrics_history_old 表');
 
-    await db.prepare(`DROP TABLE IF EXISTS globalping_outbound_points`).run();
-    await db.prepare(`DROP TABLE IF EXISTS globalping_outbound_state`).run();
-    debug('✅ 已删除 Globalping 出站延迟表');
-    
     dbInitialized = false;
     
     await initDatabase(db);

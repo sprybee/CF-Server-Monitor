@@ -93,6 +93,23 @@ export async function ensureOutboundTables(db) {
   await db.prepare(CREATE_STATE_SQL).run();
 }
 
+// One row. The bucket update is the cron claim: only the isolate that changes
+// the bucket proceeds, so overlapping Workers cron isolates cannot both post.
+export async function claimOutboundBucket(db, bucket) {
+  await ensureOutboundTables(db);
+  await db.prepare(`
+    INSERT INTO globalping_outbound_state (id, bucket, pending)
+    VALUES (1, NULL, '[]')
+    ON CONFLICT(id) DO NOTHING
+  `).run();
+  const result = await db.prepare(`
+    UPDATE globalping_outbound_state
+    SET bucket = ?
+    WHERE id = 1 AND (bucket IS NULL OR bucket != ?)
+  `).bind(bucket, bucket).run();
+  return Number(result?.meta?.changes || 0) === 1;
+}
+
 export async function readOutboundState(db) {
   const row = await db.prepare(
     'SELECT bucket, pending FROM globalping_outbound_state WHERE id = 1'
@@ -172,12 +189,28 @@ export async function saveOutboundPoints(db, serverId, points) {
   return inserts.length;
 }
 
+export async function getLatestOutboundCarriers(db, serverId) {
+  const result = await db.prepare(`
+    SELECT carrier, asn, status, created_at
+    FROM globalping_outbound_points
+    WHERE server_id = ? AND id IN (
+      SELECT MAX(id) FROM globalping_outbound_points
+      WHERE server_id = ?
+      GROUP BY carrier
+    )
+  `).bind(serverId, serverId).all();
+  return result.results || [];
+}
+
 export async function pruneOutboundPoints(db, serverId, cutoff) {
   await db.prepare(
     'DELETE FROM globalping_outbound_points WHERE server_id = ? AND created_at < ?'
   ).bind(serverId, cutoff).run();
 }
 
+// 8 days × 24 hours × 12 samples × 3 carriers = 6912 rows. The query is always
+// one indexed range on (server_id, created_at), so a 1-hour read is ~36 rows
+// and a 7-day read stays inside this cap instead of clipping off the newest points.
 async function selectOutboundPoints(db, serverId, sinceMs) {
   const result = await db.prepare(`
     SELECT measurement_id, created_at, carrier, asn, city, network, tags,
@@ -185,7 +218,7 @@ async function selectOutboundPoints(db, serverId, sinceMs) {
     FROM globalping_outbound_points
     WHERE server_id = ? AND created_at >= ?
     ORDER BY created_at ASC
-    LIMIT 2000
+    LIMIT 8000
   `).bind(serverId, sinceMs).all();
   return (result.results || []).map(toPublicOutboundPoint);
 }

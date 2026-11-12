@@ -512,6 +512,9 @@ export default {
       }
       const slotTime = Number(event?.scheduledTime) > 0 ? Number(event.scheduledTime) : now.getTime();
       if (isGlobalpingOutboundSlot(slotTime)) {
+        // Await the round. Fetch time is I/O, not the 10ms CPU budget, and each
+        // Globalping call has its own timeout. waitUntil would detach the D1
+        // writes from this attempt, so a frozen isolate could drop them.
         debug('[Cron] 开始执行国内到马来西亚出站延迟探测');
         await runGlobalpingOutbound(env, slotTime);
         debug('[Cron] 国内到马来西亚出站延迟探测完成');

@@ -1,6 +1,8 @@
 import { debug } from '../utils/settings.js';
 import {
+  claimOutboundBucket,
   ensureOutboundTables,
+  getLatestOutboundCarriers,
   pruneOutboundPoints,
   readOutboundState,
   saveOutboundPoints,
@@ -13,6 +15,7 @@ export const OUTBOUND_SERVER_ID = '74a08d8d-19d7-4b7a-91bc-11506f6027f7';
 export const OUTBOUND_INTERVAL_MS = 5 * 60 * 1000;
 export const OUTBOUND_RETENTION_MS = 8 * 24 * 60 * 60 * 1000;
 export const OUTBOUND_MAX_PENDING = 12;
+export const GLOBALPING_FETCH_TIMEOUT_MS = 8000;
 
 export const GLOBALPING_HEADERS = Object.freeze({
   'User-Agent': 'cf-server-monitor/2.8.7 (+https://cf-server-monitor.eliamzhao.workers.dev)',
@@ -48,8 +51,15 @@ export function outboundBucket(timestamp) {
   return Math.floor(Number(timestamp) / OUTBOUND_INTERVAL_MS);
 }
 
+export function measurementProbeCount(body) {
+  const locations = Array.isArray(body?.locations) ? body.locations : [];
+  return locations.reduce((sum, location) => sum + Number(location?.limit || 0), 0);
+}
+
 export function buildMeasurementRequest(items) {
-  return {
+  // No top-level limit: Globalping rejects locations[].limit when a global limit
+  // is present, and the router only honors per-location limit when that field is set.
+  const body = {
     type: 'ping',
     target: OUTBOUND_TARGET,
     inProgressUpdates: false,
@@ -66,6 +76,21 @@ export function buildMeasurementRequest(items) {
       port: 443
     }
   };
+  if (Object.prototype.hasOwnProperty.call(body, 'limit')) {
+    throw new Error('global limit would disable per-location limits');
+  }
+  if (measurementProbeCount(body) !== body.locations.length || body.locations.some(location => location.limit !== 1)) {
+    throw new Error('each location must request exactly one probe');
+  }
+  return body;
+}
+
+export function nextCarrierAsn(asns, lastPoint) {
+  const primary = asns[0];
+  if (!lastPoint || (lastPoint.status !== 'gap' && lastPoint.status !== 'no_probes')) return primary;
+  const index = asns.indexOf(Number(lastPoint.asn));
+  if (index < 0 || index + 1 >= asns.length) return primary;
+  return asns[index + 1];
 }
 
 export function assertMainlandLocations(body) {
@@ -170,7 +195,9 @@ export function pointsFromMeasurement(measurement, requested = []) {
 
   if (measurement?.status === 'finished') {
     for (const carrier of requestedCarriers) {
-      if (!seen.has(carrier)) points.push(gapPoint(carrier, timestamp, measurement.id || ''));
+      if (seen.has(carrier)) continue;
+      const requestedAsn = requested.find(item => item?.carrier === carrier)?.asn ?? null;
+      points.push({ ...gapPoint(carrier, timestamp, measurement.id || ''), asn: requestedAsn });
     }
   }
   return points;
@@ -196,18 +223,33 @@ function isNoProbes(status, body) {
   return status === 422 && (body?.error?.type === 'no_probes_found' || body?.type === 'no_probes_found');
 }
 
+function isFetchTimeout(error) {
+  const name = String(error?.name || '');
+  return name === 'AbortError' || name === 'TimeoutError';
+}
+
 async function globalpingFetch(fetchImpl, summary, url, options = {}) {
   summary.requests += 1;
-  const response = await fetchImpl(url, {
-    method: options.method || 'GET',
-    headers: {
-      ...GLOBALPING_HEADERS,
-      ...(options.body ? { 'Content-Type': 'application/json' } : {})
-    },
-    body: options.body
-  });
+  const signal = typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+    ? AbortSignal.timeout(GLOBALPING_FETCH_TIMEOUT_MS)
+    : undefined;
+  let response;
+  try {
+    response = await fetchImpl(url, {
+      method: options.method || 'GET',
+      headers: {
+        ...GLOBALPING_HEADERS,
+        ...(options.body ? { 'Content-Type': 'application/json' } : {})
+      },
+      body: options.body,
+      signal
+    });
+  } catch (error) {
+    if (isFetchTimeout(error)) return { response: null, body: null, timeout: true };
+    throw error;
+  }
   const body = await readGlobalpingJson(response);
-  return { response, body };
+  return { response, body, timeout: false };
 }
 
 async function postLocations(fetchImpl, summary, items) {
@@ -216,18 +258,32 @@ async function postLocations(fetchImpl, summary, items) {
     method: 'POST',
     body: JSON.stringify(payload)
   });
+  if (result.timeout || !result.response) return { timeout: true };
   const remaining = remainingCreateCredits(result.body, result.response.headers);
+  const probesCount = Number(result.body?.probesCount);
   if ((result.response.status === 202 || result.response.status === 200) && result.body?.id) {
-    return { ok: true, id: result.body.id, remaining };
+    return {
+      ok: true,
+      id: result.body.id,
+      remaining,
+      probesCount: Number.isFinite(probesCount) ? probesCount : items.length
+    };
   }
   if (result.response.status === 429) return { rateLimited: true, remaining: 0 };
   if (isNoProbes(result.response.status, result.body)) return { noProbes: true, remaining };
   return { error: true, remaining };
 }
 
+function creditsAfter(credits, result, requestedProbes) {
+  if (result.remaining !== null && result.remaining !== undefined) return result.remaining;
+  const used = Number.isFinite(result.probesCount) ? result.probesCount : requestedProbes;
+  return credits - used;
+}
+
 async function readLimits(fetchImpl, summary) {
   try {
     const result = await globalpingFetch(fetchImpl, summary, `${GLOBALPING_API}/limits`);
+    if (result.timeout || !result.response) return { failed: true, timeout: true, remaining: null };
     if (result.response.status === 429) return { rateLimited: true, remaining: 0 };
     if (!result.response.ok) return { failed: true, remaining: null };
     const remaining = remainingCreateCredits(result.body, result.response.headers);
@@ -268,11 +324,15 @@ async function persistPending(db, fetchImpl, summary, pending, now) {
       continue;
     }
 
+    if (result.timeout || !result.response) {
+      kept.push(...items);
+      break;
+    }
     if (result.response.status === 404) {
       summary.stored += await saveOutboundPoints(
         db,
         OUTBOUND_SERVER_ID,
-        items.map(item => gapPoint(item.carrier, now, ''))
+        items.map(item => ({ ...gapPoint(item.carrier, now, ''), asn: item.asn ?? null }))
       );
       continue;
     }
@@ -295,73 +355,71 @@ async function persistPending(db, fetchImpl, summary, pending, now) {
   return { pending: kept, rateLimited };
 }
 
-async function placeCarriers(fetchImpl, summary, remaining) {
+async function placeCarriers(fetchImpl, summary, remaining, choices) {
   const placed = [];
   const gaps = [];
-  let credits = remaining === null ? OUTBOUND_CARRIERS.length : remaining;
-
-  if (credits >= OUTBOUND_CARRIERS.length) {
-    const primary = OUTBOUND_CARRIERS.map(item => ({ carrier: item.carrier, asn: item.asns[0] }));
-    const result = await postLocations(fetchImpl, summary, primary);
-    if (result.ok) {
-      for (const item of primary) placed.push({ ...item, id: result.id });
-      summary.posted += 1;
-      return { placed, gaps, rateLimited: false };
-    }
-    if (result.rateLimited) {
-      return {
-        placed,
-        gaps: OUTBOUND_CARRIERS.map(item => item.carrier),
-        rateLimited: true
-      };
-    }
-    if (!result.noProbes) {
-      return {
-        placed,
-        gaps: OUTBOUND_CARRIERS.map(item => item.carrier),
-        rateLimited: false
-      };
-    }
-    if (result.remaining !== null && result.remaining !== undefined) credits = result.remaining;
+  const probeCount = choices.length;
+  if (remaining !== null && remaining < probeCount) {
+    return {
+      placed,
+      gaps: choices.map(item => item.carrier),
+      rateLimited: true
+    };
   }
+  let credits = remaining === null ? probeCount : remaining;
+  const combined = await postLocations(fetchImpl, summary, choices);
+  if (combined.timeout) return { placed, gaps, rateLimited: false, timeout: true };
+  if (combined.ok) {
+    summary.posted += 1;
+    return {
+      placed: choices.map(item => ({ ...item, id: combined.id })),
+      gaps,
+      rateLimited: false
+    };
+  }
+  if (combined.rateLimited || !combined.noProbes) {
+    return {
+      placed,
+      gaps: choices.map(item => item.carrier),
+      rateLimited: Boolean(combined.rateLimited)
+    };
+  }
+  credits = creditsAfter(credits, combined, 0);
 
-  for (const spec of OUTBOUND_CARRIERS) {
+  for (const choice of choices) {
+    const spec = OUTBOUND_CARRIERS.find(item => item.carrier === choice.carrier);
+    const fallbacks = (spec?.asns || []).filter(asn => asn !== choice.asn);
     if (credits < 1) {
-      gaps.push(spec.carrier);
+      gaps.push(choice.carrier);
       continue;
     }
     let placedCarrier = false;
-    for (const asn of spec.asns) {
+    for (const asn of fallbacks) {
       if (credits < 1) break;
-      const result = await postLocations(fetchImpl, summary, [{ carrier: spec.carrier, asn }]);
+      const result = await postLocations(fetchImpl, summary, [{ carrier: choice.carrier, asn }]);
+      if (result.timeout) {
+        if (!placedCarrier) gaps.push(choice.carrier);
+        for (const rest of choices.slice(choices.indexOf(choice) + 1)) gaps.push(rest.carrier);
+        return { placed, gaps, rateLimited: false, timeout: true };
+      }
       if (result.ok) {
-        placed.push({ carrier: spec.carrier, asn, id: result.id });
+        placed.push({ carrier: choice.carrier, asn, id: result.id });
         summary.posted += 1;
-        credits = result.remaining === null || result.remaining === undefined ? credits - 1 : result.remaining;
+        credits = creditsAfter(credits, result, 1);
         placedCarrier = true;
         break;
       }
       if (result.rateLimited) {
-        if (!placedCarrier) gaps.push(spec.carrier);
-        for (const rest of OUTBOUND_CARRIERS.slice(OUTBOUND_CARRIERS.indexOf(spec) + 1)) {
-          gaps.push(rest.carrier);
-        }
+        if (!placedCarrier) gaps.push(choice.carrier);
+        for (const rest of choices.slice(choices.indexOf(choice) + 1)) gaps.push(rest.carrier);
         return { placed, gaps, rateLimited: true };
       }
       if (!result.noProbes) break;
-      if (result.remaining !== null && result.remaining !== undefined) credits = result.remaining;
+      credits = creditsAfter(credits, result, 0);
     }
-    if (!placedCarrier) gaps.push(spec.carrier);
+    if (!placedCarrier) gaps.push(choice.carrier);
   }
   return { placed, gaps, rateLimited: false };
-}
-
-function capPending(pending) {
-  if (pending.length <= OUTBOUND_MAX_PENDING) return { pending, dropped: [] };
-  return {
-    pending: pending.slice(pending.length - OUTBOUND_MAX_PENDING),
-    dropped: pending.slice(0, pending.length - OUTBOUND_MAX_PENDING)
-  };
 }
 
 export async function runGlobalpingOutbound(env, now = Date.now(), deps = {}) {
@@ -374,24 +432,23 @@ export async function runGlobalpingOutbound(env, now = Date.now(), deps = {}) {
     }
     const bucket = outboundBucket(now);
     await ensureOutboundTables(env.DB);
-    await pruneOutboundPoints(env.DB, OUTBOUND_SERVER_ID, now - OUTBOUND_RETENTION_MS);
-    const state = await readOutboundState(env.DB);
-    if (state.bucket === bucket) {
+    const claimed = await claimOutboundBucket(env.DB, bucket);
+    if (!claimed) {
       summary.skipped = 'already_ran';
       return summary;
     }
+    await pruneOutboundPoints(env.DB, OUTBOUND_SERVER_ID, now - OUTBOUND_RETENTION_MS);
+    const state = await readOutboundState(env.DB);
 
     const limits = await readLimits(fetchImpl, summary);
-    if (limits.rateLimited || limits.failed) {
-      if (limits.rateLimited) {
-        summary.stored += await saveOutboundPoints(
-          env.DB,
-          OUTBOUND_SERVER_ID,
-          OUTBOUND_CARRIERS.map(item => gapPoint(item.carrier, now, ''))
-        );
-      }
+    if (limits.failed) {
       await writeOutboundState(env.DB, bucket, state.pending);
-      summary.skipped = limits.rateLimited ? 'rate_limit' : 'limits_unavailable';
+      summary.skipped = limits.timeout ? 'timeout' : 'limits_unavailable';
+      return summary;
+    }
+    if (limits.rateLimited || (limits.remaining !== null && limits.remaining < OUTBOUND_CARRIERS.length)) {
+      await writeOutboundState(env.DB, bucket, state.pending);
+      summary.skipped = 'rate_limit';
       return summary;
     }
 
@@ -401,24 +458,35 @@ export async function runGlobalpingOutbound(env, now = Date.now(), deps = {}) {
       summary.skipped = 'rate_limit';
       return summary;
     }
+    if (persisted.pending.length >= OUTBOUND_MAX_PENDING) {
+      await writeOutboundState(env.DB, bucket, persisted.pending);
+      summary.skipped = 'pending_full';
+      return summary;
+    }
 
-    const placed = await placeCarriers(fetchImpl, summary, limits.remaining);
+    const latest = await getLatestOutboundCarriers(env.DB, OUTBOUND_SERVER_ID);
+    const latestByCarrier = new Map(latest.map(point => [point.carrier, point]));
+    const choices = OUTBOUND_CARRIERS.map(item => ({
+      carrier: item.carrier,
+      asn: nextCarrierAsn(item.asns, latestByCarrier.get(item.carrier))
+    }));
+    const placed = await placeCarriers(fetchImpl, summary, limits.remaining, choices);
+    if (placed.timeout) {
+      await writeOutboundState(env.DB, bucket, [...persisted.pending, ...placed.placed]);
+      summary.skipped = 'timeout';
+      return summary;
+    }
     if (placed.gaps.length > 0) {
+      const asnByCarrier = new Map(choices.map(item => [item.carrier, item.asn]));
       summary.stored += await saveOutboundPoints(
         env.DB,
         OUTBOUND_SERVER_ID,
-        placed.gaps.map(carrier => gapPoint(carrier, now, ''))
+        placed.gaps.map(carrier => ({ ...gapPoint(carrier, now, ''), asn: asnByCarrier.get(carrier) ?? null }))
       );
     }
-    const capped = capPending([...persisted.pending, ...placed.placed]);
-    if (capped.dropped.length > 0) {
-      summary.stored += await saveOutboundPoints(
-        env.DB,
-        OUTBOUND_SERVER_ID,
-        capped.dropped.map(item => gapPoint(item.carrier, now, ''))
-      );
-    }
-    await writeOutboundState(env.DB, bucket, capped.pending);
+    const room = Math.max(0, OUTBOUND_MAX_PENDING - persisted.pending.length);
+    const accepted = placed.placed.slice(0, room);
+    await writeOutboundState(env.DB, bucket, [...persisted.pending, ...accepted]);
     if (placed.rateLimited) summary.skipped = 'rate_limit';
     return summary;
   } catch (error) {

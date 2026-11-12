@@ -20,10 +20,13 @@ import {
   buildMeasurementRequest,
   gapPoint,
   isGlobalpingOutboundSlot,
+  measurementProbeCount,
+  nextCarrierAsn,
   pointsFromMeasurement,
   readGlobalpingJson,
   runGlobalpingOutbound
 } from '../src/services/globalpingOutbound.js';
+import { outboundLossValue, outboundPingValue } from '../src/frontend/utils/outboundLatency.js';
 import {
   attachOutboundPoints,
   buildOutboundChartSeries
@@ -61,6 +64,9 @@ function assertMainlandRequest(body) {
   const parsed = typeof body === 'string' ? JSON.parse(body) : body;
   assertMainlandLocations(parsed);
   assert.equal(parsed.target, OUTBOUND_TARGET);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsed, 'limit'), false);
+  assert.equal(measurementProbeCount(parsed), parsed.locations.length);
+  assert.equal(parsed.locations.every(location => location.limit === 1), true);
   assert.equal(parsed.inProgressUpdates, false);
   assert.equal(parsed.measurementOptions.protocol, 'TCP');
   assert.equal(parsed.measurementOptions.port, 443);
@@ -126,6 +132,9 @@ test('measurement locations stay on mainland China ASNs', () => {
   const body = buildMeasurementRequest(OUTBOUND_CARRIERS.map(item => ({ asn: item.asns[0] })));
   assertMainlandRequest(body);
   assert.equal(body.locations.length, 3);
+  assert.equal(measurementProbeCount(body), 3);
+  assert.equal(nextCarrierAsn([4134, 4812, 4811], { status: 'gap', asn: 4134 }), 4812);
+  assert.equal(nextCarrierAsn([4134, 4812, 4811], { status: 'finished', asn: 4812 }), 4134);
   assert.throws(() => assertMainlandLocations({
     locations: [{ country: 'HK', asn: 4134, tags: ['eyeball-network'], limit: 1 }]
   }));
@@ -189,6 +198,10 @@ test('disabled and missing outbound series stay hidden and timeouts are null', (
   assert.equal(timeout.hidden, false);
   assert.deepEqual(timeout.rows.map(row => row.y), [30, null]);
   assert.deepEqual(timeout.rows.map(row => row.loss), [0, null]);
+  assert.equal(outboundPingValue({ status: 'finished', avg: 0, loss: 100 }), null);
+  assert.equal(outboundPingValue({ status: 'finished', avg: null, loss: null }), null);
+  assert.equal(outboundLossValue({ status: 'finished', avg: null, loss: null }), null);
+  assert.equal(outboundLossValue({ status: 'timeout', avg: null, loss: 100 }), null);
 
   const server = { ping: [{ ts: 1, ct: 12, cu: 13, cm: 14 }], loss: [{ ts: 1, ct: 0 }] };
   attachOutboundPoints(server, [{ timestamp: 2, carrier: 'ct', avg: 40, status: 'finished' }]);
@@ -287,7 +300,9 @@ test('429, no_probes_found, and a missing previous id do not throw or use HK', a
     assert.notEqual(noProbes.skipped, 'error');
     assert.equal(probeCalls.some(call => /"country":"HK"|"country":"MO"|"country":"TW"|"magic"/.test(call.body)), false);
     const posted = probeCalls.filter(call => call.body);
-    assert.equal(posted.length, 1 + 3 + 3 + 5);
+    assert.equal(posted.length, 1 + 2 + 2 + 4);
+    assert.equal(posted.filter(call => measurementProbeCount(JSON.parse(call.body)) > 1).length, 1);
+    assert.equal(posted.every(call => measurementProbeCount(JSON.parse(call.body)) <= 3), true);
     const gaps = (await getOutboundHistory(db, OUTBOUND_SERVER_ID, 0)).filter(point => point.status === 'gap');
     assert.equal(gaps.some(point => point.carrier === 'ct'), true);
     assert.equal(gaps.some(point => point.carrier === 'cu'), true);
@@ -308,7 +323,9 @@ test('429, no_probes_found, and a missing previous id do not throw or use HK', a
     assert.equal(recovered.posted, 1);
     const state = await readOutboundState(db);
     assert.equal(state.pending.every(item => item.id === 'created-id'), true);
-    assert.equal(state.pending.some(item => item.asn === 4134), true);
+    assert.equal(new Set(state.pending.map(item => item.carrier)).size, 3);
+    assert.equal(state.pending.every(item => ALLOWED_ASNS.has(item.asn)), true);
+    assert.equal(gaps.every(point => point.avg === null && point.loss === null), true);
   } finally {
     await miniflare.dispose();
   }
@@ -391,6 +408,122 @@ test('history API returns outbound points and private mode still denies anonymou
   } finally {
     clearSiteSettingsCache();
     clearServerDetailCache();
+    await miniflare.dispose();
+  }
+});
+
+test('a gap advances only that carrier to the next mainland ASN', async () => {
+  const miniflare = createMiniflare('globalping-asn');
+  try {
+    const db = await miniflare.getD1Database('DB');
+    await saveOutboundPoints(db, OUTBOUND_SERVER_ID, [
+      { ...gapPoint('ct', Date.UTC(2026, 10, 12, 6, 0), ''), asn: 4134 }
+    ]);
+    let body = null;
+    const summary = await runGlobalpingOutbound({ DB: db }, Date.UTC(2026, 10, 12, 6, 5), {
+      fetchImpl: async (url, options = {}) => {
+        if (String(url).endsWith('/limits')) return jsonResponse(limitsBody(10), 200, { 'X-RateLimit-Remaining': '10' });
+        if (String(url).endsWith('/measurements')) {
+          body = JSON.parse(options.body);
+          return jsonResponse({ id: 'advanced', probesCount: 3 }, 202, { 'X-RateLimit-Remaining': '7' });
+        }
+        throw new Error(`unexpected ${url}`);
+      }
+    });
+    assert.equal(summary.posted, 1);
+    assert.equal(measurementProbeCount(body), 3);
+    assert.deepEqual(body.locations.map(location => location.asn).sort((a, b) => a - b), [4812, 4837, 9808]);
+  } finally {
+    await miniflare.dispose();
+  }
+});
+
+test('a second isolate does not post, in-progress ids stay pending, and quota failures do not write server config', async () => {
+  const miniflare = createMiniflare('globalping-safety');
+  try {
+    const db = await miniflare.getD1Database('DB');
+    await db.prepare('CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)').run();
+    await db.prepare('CREATE TABLE servers (id TEXT PRIMARY KEY, name TEXT, traffic_limit TEXT, net_rx_monthly REAL)').run();
+    await db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').bind('site_options', JSON.stringify({
+      is_public: 'false',
+      auto_discovery: 'false',
+      traffic_limit: 'leave-me'
+    })).run();
+    await db.prepare('INSERT INTO servers (id, name, traffic_limit, net_rx_monthly) VALUES (?, ?, ?, ?)')
+      .bind(OUTBOUND_SERVER_ID, 'my-vps', '250', 12345).run();
+    await ensureOutboundTables(db);
+    await writeOutboundState(db, null, [
+      { id: 'inflight', carrier: 'ct', asn: 4134 },
+      { id: 'inflight', carrier: 'cu', asn: 4837 },
+      { id: 'inflight', carrier: 'cm', asn: 9808 }
+    ]);
+
+    let posts = 0;
+    const fetchImpl = async (url, options = {}) => {
+      if (String(url).endsWith('/limits')) return jsonResponse(limitsBody(40), 200, { 'X-RateLimit-Remaining': '40' });
+      if (String(url).includes('/measurements/inflight')) {
+        return jsonResponse({
+          id: 'inflight',
+          status: 'in-progress',
+          createdAt: '2026-11-12T05:00:00.000Z',
+          results: []
+        });
+      }
+      if (String(url).endsWith('/measurements')) {
+        posts += 1;
+        const body = JSON.parse(options.body);
+        assert.equal(measurementProbeCount(body), 3);
+        return jsonResponse({ id: 'round-2', probesCount: 3 }, 202, { 'X-RateLimit-Remaining': '37' });
+      }
+      throw new Error(`unexpected ${url}`);
+    };
+
+    const now = Date.UTC(2026, 10, 12, 5, 0);
+    const [first, second] = await Promise.all([
+      runGlobalpingOutbound({ DB: db }, now, { fetchImpl }),
+      runGlobalpingOutbound({ DB: db }, now, { fetchImpl })
+    ]);
+    assert.equal(posts, 1);
+    assert.equal([first.skipped, second.skipped].filter(value => value === 'already_ran').length, 1);
+    const pending = (await readOutboundState(db)).pending;
+    assert.equal(pending.some(item => item.id === 'inflight'), true);
+    assert.equal(pending.some(item => item.id === 'round-2'), true);
+
+    const starved = await runGlobalpingOutbound({ DB: db }, Date.UTC(2026, 10, 12, 5, 5), {
+      fetchImpl: async (url) => {
+        assert.equal(String(url).endsWith('/limits'), true);
+        return jsonResponse(limitsBody(2), 200, { 'X-RateLimit-Remaining': '2' });
+      }
+    });
+    assert.equal(starved.posted, 0);
+    assert.equal(starved.skipped, 'rate_limit');
+    assert.equal((await readOutboundState(db)).pending.some(item => item.id === 'inflight'), true);
+
+    const unavailable = await runGlobalpingOutbound({ DB: db }, Date.UTC(2026, 10, 12, 5, 10), {
+      fetchImpl: async () => jsonResponse({ error: { type: 'server_error' } }, 500)
+    });
+    assert.equal(unavailable.posted, 0);
+    assert.equal(unavailable.skipped, 'limits_unavailable');
+
+    const timedOut = await runGlobalpingOutbound({ DB: db }, Date.UTC(2026, 10, 12, 5, 15), {
+      fetchImpl: async () => {
+        const error = new Error('timed out');
+        error.name = 'TimeoutError';
+        throw error;
+      }
+    });
+    assert.equal(timedOut.posted, 0);
+    assert.equal(timedOut.skipped, 'timeout');
+    assert.equal((await readOutboundState(db)).pending.some(item => item.id === 'inflight'), true);
+
+    const server = await db.prepare('SELECT traffic_limit, net_rx_monthly FROM servers WHERE id = ?').bind(OUTBOUND_SERVER_ID).first();
+    assert.equal(server.traffic_limit, '250');
+    assert.equal(server.net_rx_monthly, 12345);
+    const settings = await db.prepare('SELECT value FROM settings WHERE key = ?').bind('site_options').first();
+    assert.equal(JSON.parse(settings.value).auto_discovery, 'false');
+    const historyCount = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'metrics_history'").first();
+    assert.equal(historyCount, null);
+  } finally {
     await miniflare.dispose();
   }
 });
