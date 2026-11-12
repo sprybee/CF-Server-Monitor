@@ -1679,6 +1679,24 @@ body::before {
     border: 0;
 }
 
+.outbound-latency {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--border-color);
+}
+
+.outbound-latency-caption,
+.outbound-chart-note {
+    color: var(--text-muted);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: none;
+}
+
 .three-net-columns {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));

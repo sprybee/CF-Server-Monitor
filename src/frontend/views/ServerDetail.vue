@@ -331,6 +331,7 @@
           <span class="chart-title">
             <span class="chart-title-icon">▸</span>
             {{ trans.latencyMonitor }}
+            <span v-if="hasOutboundSeries" class="outbound-chart-note">{{ trans.outboundLatency }}</span>
           </span>
           <div class="chart-header-actions">
             <div class="ping-indicator">
@@ -402,7 +403,8 @@ import TerminalHeader from '../components/TerminalHeader.vue'
 import Footer from '../components/Footer.vue'
 import OsIcon from '../components/OsIcon.vue'
 import LiveConnectionTimeoutModal from '../components/LiveConnectionTimeoutModal.vue'
-import { fetchServerDetail, fetchAllHistory, fetchConfig, formatBytes, createLiveSocket, getFlagRegionCode, isServerOnline, normalizeLiveSocketTimeoutMinutes } from '../utils/api.js'
+import { fetchServerDetail, fetchAllHistory, fetchOutboundHistory, fetchConfig, formatBytes, createLiveSocket, getFlagRegionCode, isServerOnline, normalizeLiveSocketTimeoutMinutes } from '../utils/api.js'
+import { buildOutboundChartSeries } from '../utils/outboundLatency.js'
 import { isAdminLoggedIn } from '../utils/http'
 import { getTrafficUsageBytes } from '../composables/useServerCardData'
 import { getPublicAssetUrl } from '../utils/config.js'
@@ -501,6 +503,14 @@ const PING_FIELD_DEFS = [
   { field: 'ping_node_4', lossField: 'loss_node_4', labelKey: 'node4', className: 'ping-node-4', datasetIndex: 7 }
 ]
 const pingLabel = (key) => String(appConfig?.[key.startsWith('node_') ? `${key}_name` : `custom_${key}_name`] || trans.value[`ping${key.toUpperCase().charAt(0)}${key.slice(1)}`] || key.toUpperCase())
+const OUTBOUND_SERIES = ['ct', 'cu', 'cm']
+const OUTBOUND_DATASET_OFFSET = PING_FIELD_DEFS.length
+const outboundLabel = (carrier) => trans.value[`outboundPing${carrier.charAt(0).toUpperCase()}${carrier.slice(1)}`] || `CN→VPS ${carrier.toUpperCase()}`
+const outboundDataset = (carrier, index) => ds(
+  outboundLabel(carrier),
+  ['#00d4aa', '#ffb870', '#4da6ff'][index],
+  { tension: 0.3, borderDash: [5, 4], hidden: true, noDataProbe: true, outboundCarrier: carrier }
+)
 
 const DISK_IO_FIELDS = ['read_bps', 'write_bps', 'read_iops', 'write_iops', 'await_ms', 'util']
 const EMPTY_DISK_IO = Object.freeze(Object.fromEntries(DISK_IO_FIELDS.map(field => [field, 0])))
@@ -773,7 +783,9 @@ const visiblePingFields = computed(() => PING_FIELD_DEFS.filter(item => {
   const value = server.value[item.field]
   return value !== undefined && !isDisabledProbeMetric(value)
 }))
-const hasPingData = computed(() => visiblePingFields.value.length > 0)
+const outboundPoints = ref([])
+const hasOutboundSeries = computed(() => OUTBOUND_SERIES.some(carrier => !buildOutboundChartSeries(outboundPoints.value, carrier).hidden))
+const hasPingData = computed(() => visiblePingFields.value.length > 0 || hasOutboundSeries.value)
 const visiblePingStats = computed(() => visiblePingFields.value.map(item => ({
   ...item,
   label: pingLabel(item.field.replace('ping_', '')),
@@ -971,8 +983,8 @@ const CHART_DEFS = [
   { key: 'proc', ref: () => procChartRef.value, datasets: [ds('Processes', '#f778ba', { fill: true })] },
   { key: 'net', ref: () => netChartRef.value, datasets: [ds('Download', '#00d4aa', { fill: true }), ds('Upload', '#4da6ff', { fill: true })], legend: true, formatValue: (v) => formatBytes(v) + '/s', tickFormat: (v) => formatBytes(v) },
   { key: 'conn', ref: () => connChartRef.value, datasets: [ds('TCP', '#b392f0'), ds('UDP', '#f778ba')], legend: true },
-  { key: 'ping', ref: () => pingChartRef.value, datasets: ['ct', 'cu', 'cm', 'bd', 'node_1', 'node_2', 'node_3', 'node_4'].map((key, i) => ds(pingLabel(key), ['#00d4aa', '#ffb870', '#4da6ff', '#b392f0', '#ff7b72', '#79c0ff', '#7ee787', '#ffa657'][i], { tension: 0.3 })), unit: ' ms', legend: true },
-  { key: 'loss', ref: () => lossChartRef.value, datasets: ['ct', 'cu', 'cm', 'bd', 'node_1', 'node_2', 'node_3', 'node_4'].map((key, i) => ds(pingLabel(key), ['#00d4aa', '#ffb870', '#4da6ff', '#b392f0', '#ff7b72', '#79c0ff', '#7ee787', '#ffa657'][i], { tension: 0.3 })), unit: '%', legend: true },
+  { key: 'ping', ref: () => pingChartRef.value, datasets: ['ct', 'cu', 'cm', 'bd', 'node_1', 'node_2', 'node_3', 'node_4'].map((key, i) => ds(pingLabel(key), ['#00d4aa', '#ffb870', '#4da6ff', '#b392f0', '#ff7b72', '#79c0ff', '#7ee787', '#ffa657'][i], { tension: 0.3 })).concat(OUTBOUND_SERIES.map(outboundDataset)), unit: ' ms', legend: true },
+  { key: 'loss', ref: () => lossChartRef.value, datasets: ['ct', 'cu', 'cm', 'bd', 'node_1', 'node_2', 'node_3', 'node_4'].map((key, i) => ds(pingLabel(key), ['#00d4aa', '#ffb870', '#4da6ff', '#b392f0', '#ff7b72', '#79c0ff', '#7ee787', '#ffa657'][i], { tension: 0.3 })).concat(OUTBOUND_SERIES.map(outboundDataset)), unit: '%', legend: true },
   { key: 'load', ref: () => loadChartRef.value, datasets: [ds(trans.value.load1m || '1 Min', '#00d4aa', { tension: 0.3 }), ds(trans.value.load5m || '5 Min', '#ffb870', { tension: 0.3 }), ds(trans.value.load15m || '15 Min', '#4da6ff', { tension: 0.3 })], legend: true }
 ]
 
@@ -1358,9 +1370,47 @@ const clearDiskIoChart = () => {
   chart.update('none')
 }
 
+const applyOutboundSeries = (points) => {
+  outboundPoints.value = Array.isArray(points) ? points : []
+  for (const chartKey of ['ping', 'loss']) {
+    const chart = charts[chartKey]
+    if (!chart) continue
+    OUTBOUND_SERIES.forEach((carrier, index) => {
+      const datasetIndex = OUTBOUND_DATASET_OFFSET + index
+      const dataset = chart.data.datasets[datasetIndex]
+      if (!dataset) return
+      const series = buildOutboundChartSeries(outboundPoints.value, carrier)
+      const wasAutoHidden = !!(dataset.noDataProbe || dataset.disabledProbe)
+      dataset.noDataProbe = series.hidden
+      dataset.disabledProbe = series.hidden
+      if (series.hidden) {
+        dataset.hidden = true
+        if (typeof chart.setDatasetVisibility === 'function') chart.setDatasetVisibility(datasetIndex, false)
+      } else if (wasAutoHidden) {
+        dataset.hidden = false
+        dataset.disabledProbe = false
+        dataset.noDataProbe = false
+        if (typeof chart.setDatasetVisibility === 'function') chart.setDatasetVisibility(datasetIndex, true)
+      }
+      const accessor = chartKey === 'loss' ? (row) => row.loss : (row) => row.y
+      updateChartDataset(chart, datasetIndex, series.hidden ? [] : series.rows, accessor)
+    })
+    if (typeof chart.resize === 'function') chart.resize()
+  }
+}
+
 const loadAllHistory = async (hours) => {
   try {
-    const allData = await fetchAllHistory(serverId, hours, apiIndex.value)
+    const historyResult = await Promise.all([
+      fetchAllHistory(serverId, hours, apiIndex.value),
+      fetchOutboundHistory(serverId, hours, apiIndex.value).catch(error => {
+        if (error && error.status === 401) throw error
+        console.error('[ERROR] Load outbound history failed:', error)
+        return []
+      })
+    ])
+    const allData = historyResult[0]
+    const outboundData = historyResult[1]
     lastReportChartUpdateTime = 0
     lossHistoryFields.value = Object.fromEntries(PING_FIELD_DEFS.map(item => [
       item.lossField,
@@ -1446,6 +1496,7 @@ const loadAllHistory = async (hours) => {
       syncProbeChartVisibility()
     }
 
+    applyOutboundSeries(outboundData)
     updateAllChartTimeUnits(hours)
     historyLoaded.value = true
 

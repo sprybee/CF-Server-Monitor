@@ -3,6 +3,7 @@ import { formatBytes, getFlagRegionCode, isServerOnline } from '../utils/api'
 import { getPublicAssetUrl } from '../utils/config'
 import { currentLang, useTranslation } from '../utils/i18n'
 import { LATENCY_WINDOW, PING } from '../utils/constants'
+import { OUTBOUND_SERIES, buildOutboundChartSeries } from '../utils/outboundLatency'
 import { formatBillingPrice } from '../utils/server.js'
 
 export const DEFAULT_SERVER_CARD_CONFIG = {
@@ -446,6 +447,32 @@ export function useServerCardData(props) {
 
   const hasThreeNetDetails = computed(() => threeNetDetails.value.length > 0)
 
+  const outboundCaption = computed(() => trans.value.outboundLatency || 'CN→VPS')
+  const outboundRows = computed(() => {
+    const points = Array.isArray(props.server.outbound?.points) ? props.server.outbound.points : []
+    return OUTBOUND_SERIES.flatMap(carrier => {
+      const series = buildOutboundChartSeries(points, carrier)
+      if (series.hidden) return []
+      const samples = series.rows.slice(-DEFAULT_THREE_NET_POINT_COUNT)
+      const latestPing = [...samples].reverse().find(sample => typeof sample.y === 'number')?.y ?? null
+      const labelKey = `outboundPing${carrier.charAt(0).toUpperCase()}${carrier.slice(1)}`
+      return [{
+        key: `outbound-${carrier}`,
+        label: trans.value[labelKey] || carrier.toUpperCase(),
+        latestPing,
+        points: samples.map(sample => {
+          const hasPing = typeof sample.y === 'number'
+          return {
+            pingHeight: hasPing ? 84 : 25,
+            pingColor: hasPing ? getPingColor(sample.y) : 'var(--accent-red)',
+            pingOpacity: hasPing ? 0.94 : 0.52,
+            pingTooltip: formatBucketTooltip(sample.timestamp, hasPing ? `${sample.y} ms` : trans.value.timeout)
+          }
+        })
+      }]
+    })
+  })
+
   const pingList = computed(() => [
     { label: 'CT', value: props.server.ping_ct },
     { label: 'CU', value: props.server.ping_cu },
@@ -512,6 +539,8 @@ export function useServerCardData(props) {
     hasPingData,
     threeNetDetails,
     hasThreeNetDetails,
+    outboundRows,
+    outboundCaption,
     getPublicAssetUrl,
     formatBytes
   }

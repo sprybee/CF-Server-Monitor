@@ -125,6 +125,8 @@
         :format-ping-value="formatPingValue"
         :format-loss-value="formatLossValue"
         :is-ping-valid="isPingValid"
+        :outbound-rows="outboundRows"
+        :outbound-caption="outboundCaption"
       />
     </div>
   </router-link>
@@ -187,6 +189,8 @@ const {
   hasPingData,
   threeNetDetails,
   hasThreeNetDetails,
+  outboundRows,
+  outboundCaption,
   getPublicAssetUrl,
   tagList,
   tagColorClass,
