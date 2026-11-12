@@ -3,7 +3,7 @@ import { formatBytes, getFlagRegionCode, isServerOnline } from '../utils/api'
 import { getPublicAssetUrl } from '../utils/config'
 import { currentLang, useTranslation } from '../utils/i18n'
 import { LATENCY_WINDOW, PING } from '../utils/constants'
-import { OUTBOUND_SERIES, buildOutboundChartSeries } from '../utils/outboundLatency'
+import { OUTBOUND_SERIES, buildOutboundHistorySlots } from '../utils/outboundLatency'
 import { formatBillingPrice } from '../utils/server.js'
 
 export const DEFAULT_SERVER_CARD_CONFIG = {
@@ -390,6 +390,24 @@ export function useServerCardData(props) {
     return normalizeProbeMetricValue(last[key]) === false
   }
 
+  const paintLatencyPoint = ({ ping, loss, timestamp }) => {
+    const hasPing = typeof ping === 'number' && Number.isFinite(ping) && ping >= 0
+    const hasLoss = typeof loss === 'number' && Number.isFinite(loss)
+    const offline = !hasPing && !hasLoss
+    return {
+      ping: hasPing ? ping : null,
+      loss: hasLoss ? loss : null,
+      pingHeight: hasPing ? 84 : 25,
+      lossHeight: hasLoss ? 84 : 25,
+      pingColor: hasPing ? getPingColor(ping) : 'var(--accent-red)',
+      lossColor: offline ? 'var(--accent-red)' : getLossColor(loss),
+      pingOpacity: hasPing ? 0.94 : 0.52,
+      lossOpacity: hasLoss ? 0.94 : (offline ? 0.52 : 0.42),
+      pingTooltip: formatBucketTooltip(timestamp, formatPingBucketSummary(hasPing, ping, offline)),
+      lossTooltip: formatBucketTooltip(timestamp, formatLossBucketSummary(hasLoss, loss, offline))
+    }
+  }
+
   const buildThreeNetRow = (def) => {
     const customName = props.sysConfig?.[def.nameKey]
     const label = String(customName || trans.value[def.labelKey] || def.fallbackLabel)
@@ -399,26 +417,11 @@ export function useServerCardData(props) {
     const points = Array.from({ length: pointCount }, (_, index) => {
       const pingPoint = pingSeries[index] ?? null
       const lossPoint = lossSeries[index] ?? null
-      const ping = pingPoint?.value ?? null
-      const loss = lossPoint?.value ?? null
-      const timestamp = pingPoint?.ts ?? lossPoint?.ts ?? null
-      const hasPing = typeof ping === 'number' && Number.isFinite(ping) && ping >= 0
-      const hasLoss = typeof loss === 'number' && Number.isFinite(loss)
-      const offline = !hasPing && !hasLoss
-      const pingSummary = formatPingBucketSummary(hasPing, ping, offline)
-      const lossSummary = formatLossBucketSummary(hasLoss, loss, offline)
-      return {
-        ping,
-        loss,
-        pingHeight: hasPing ? 84 : 25,
-        lossHeight: hasLoss ? 84 : 25,
-        pingColor: hasPing ? getPingColor(ping) : 'var(--accent-red)',
-        lossColor: offline ? 'var(--accent-red)' : getLossColor(loss),
-        pingOpacity: hasPing ? 0.94 : 0.52,
-        lossOpacity: hasLoss ? 0.94 : (offline ? 0.52 : 0.42),
-        pingTooltip: formatBucketTooltip(timestamp, pingSummary),
-        lossTooltip: formatBucketTooltip(timestamp, lossSummary)
-      }
+      return paintLatencyPoint({
+        ping: pingPoint?.value ?? null,
+        loss: lossPoint?.value ?? null,
+        timestamp: pingPoint?.ts ?? lossPoint?.ts ?? null
+      })
     })
     const hasMeasuredPoint = points.some(point => (
       (typeof point.ping === 'number' && Number.isFinite(point.ping)) ||
@@ -447,28 +450,35 @@ export function useServerCardData(props) {
 
   const hasThreeNetDetails = computed(() => threeNetDetails.value.length > 0)
 
-  const outboundCaption = computed(() => trans.value.outboundLatency || 'CN→VPS')
+  const OUTBOUND_ROW_DEFS = [
+    { carrier: 'ct', nameKey: 'custom_ct_name', labelKey: 'pingCt', fallback: '电信' },
+    { carrier: 'cu', nameKey: 'custom_cu_name', labelKey: 'pingCu', fallback: '联通' },
+    { carrier: 'cm', nameKey: 'custom_cm_name', labelKey: 'pingCm', fallback: '移动' }
+  ]
+  const outboundCaption = computed(() => trans.value.outboundLatency || '国内→本机')
   const outboundRows = computed(() => {
     const points = Array.isArray(props.server.outbound?.points) ? props.server.outbound.points : []
-    return OUTBOUND_SERIES.flatMap(carrier => {
-      const series = buildOutboundChartSeries(points, carrier)
-      if (series.hidden) return []
-      const samples = series.rows.slice(-DEFAULT_THREE_NET_POINT_COUNT)
+    const hours = Number(props.sysConfig?.latency_window?.hours)
+    const windowMs = (Number.isFinite(hours) && hours > 0 ? hours : LATENCY_WINDOW.HOURS) * 60 * 60 * 1000
+    return OUTBOUND_ROW_DEFS.flatMap(def => {
+      const grid = buildOutboundHistorySlots(points, def.carrier, { now: currentTime.value, windowMs })
+      if (!grid) return []
+      const samples = grid.slots.map(slot => slot.sample).filter(Boolean)
       const latestPing = [...samples].reverse().find(sample => typeof sample.y === 'number')?.y ?? null
-      const labelKey = `outboundPing${carrier.charAt(0).toUpperCase()}${carrier.slice(1)}`
+      const losses = samples.map(sample => sample.loss).filter(value => typeof value === 'number' && Number.isFinite(value))
+      const averageLoss = losses.length ? losses.reduce((sum, value) => sum + value, 0) / losses.length : null
+      const customName = props.sysConfig?.[def.nameKey]
       return [{
-        key: `outbound-${carrier}`,
-        label: trans.value[labelKey] || carrier.toUpperCase(),
+        key: `outbound-${def.carrier}`,
+        label: String(customName || trans.value[def.labelKey] || def.fallback),
+        slotCount: grid.slotCount,
         latestPing,
-        points: samples.map(sample => {
-          const hasPing = typeof sample.y === 'number'
-          return {
-            pingHeight: hasPing ? 84 : 25,
-            pingColor: hasPing ? getPingColor(sample.y) : 'var(--accent-red)',
-            pingOpacity: hasPing ? 0.94 : 0.52,
-            pingTooltip: formatBucketTooltip(sample.timestamp, hasPing ? `${sample.y} ms` : trans.value.timeout)
-          }
-        })
+        averageLoss,
+        points: grid.slots.map(slot => paintLatencyPoint({
+          ping: slot.sample ? slot.sample.y : null,
+          loss: slot.sample ? slot.sample.loss : null,
+          timestamp: slot.sample ? slot.sample.timestamp : slot.slotStart
+        }))
       }]
     })
   })

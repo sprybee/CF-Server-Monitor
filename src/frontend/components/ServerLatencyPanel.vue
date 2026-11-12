@@ -52,22 +52,43 @@
       </div>
     </template>
   </div>
-  <div v-if="outboundRows.length" class="outbound-latency">
+  <div v-if="outboundRows.length" :class="['three-net-panel', 'outbound-latency', { 'three-net-panel-ring': variant === 'ring' }]">
     <div class="outbound-latency-caption">{{ outboundCaption }}</div>
-    <div class="three-net-row" v-for="row in outboundRows" :key="row.key">
-      <div class="three-net-head">
-        <span class="three-net-name">{{ row.label }}</span>
-        <strong class="three-net-value" :style="{ color: getPingColor(row.latestPing) }">{{ formatPingValue(row.latestPing) }}</strong>
+    <div class="three-net-columns">
+      <div class="three-net-column" aria-label="Ping">
+        <div class="three-net-row" v-for="row in outboundRows" :key="'out-ping-' + row.key">
+          <div class="three-net-head">
+            <span class="three-net-name">{{ row.label }}</span>
+            <strong class="three-net-value" :style="{ color: getPingColor(row.latestPing) }">{{ formatPingValue(row.latestPing) }}</strong>
+          </div>
+          <div class="three-net-buckets" :style="{ '--outbound-slots': row.slotCount }">
+            <span
+              v-for="(point, index) in row.points"
+              :key="index"
+              class="three-net-bucket"
+              :data-tooltip="point.pingTooltip"
+            >
+              <span class="three-net-bucket-fill" :style="{ height: point.pingHeight + '%', background: point.pingColor, opacity: point.pingOpacity }"></span>
+            </span>
+          </div>
+        </div>
       </div>
-      <div class="three-net-buckets">
-        <span
-          v-for="(point, index) in row.points"
-          :key="index"
-          class="three-net-bucket"
-          :data-tooltip="point.pingTooltip"
-        >
-          <span class="three-net-bucket-fill" :style="{ height: point.pingHeight + '%', background: point.pingColor, opacity: point.pingOpacity }"></span>
-        </span>
+      <div class="three-net-column" aria-label="Loss">
+        <div class="three-net-row" v-for="row in outboundRows" :key="'out-loss-' + row.key">
+          <div class="three-net-head three-net-head-loss">
+            <strong class="three-net-value" :style="{ color: getLossColor(row.averageLoss) }">{{ formatLossValue(row.averageLoss) }}</strong>
+          </div>
+          <div class="three-net-buckets" :style="{ '--outbound-slots': row.slotCount }">
+            <span
+              v-for="(point, index) in row.points"
+              :key="index"
+              class="three-net-bucket"
+              :data-tooltip="point.lossTooltip"
+            >
+              <span class="three-net-bucket-fill" :style="{ height: point.lossHeight + '%', background: point.lossColor, opacity: point.lossOpacity }"></span>
+            </span>
+          </div>
+        </div>
       </div>
     </div>
   </div>
