@@ -15,6 +15,8 @@ import {
   DASHBOARD_LATENCY_WINDOW_POINTS,
   DASHBOARD_LATEST_REPORT_ID_CHUNK_SIZE
 } from '../utils/config.js';
+import { readOutboundHistory } from '../database/globalpingStore.js';
+import { OUTBOUND_SERVER_ID } from '../services/globalpingOutbound.js';
 
 const PROBE_FIELDS = ['ct', 'cu', 'cm', 'bd', 'node_1', 'node_2', 'node_3', 'node_4'];
 
@@ -92,6 +94,20 @@ function attachLatencyHistoryToServers(servers, latencyHistory) {
     const window = latencyHistory?.get(String(server.id)) || createEmptyLatencyWindow();
     server.ping = window.ping;
     server.loss = window.loss;
+  }
+}
+
+async function attachOutboundLatency(db, servers) {
+  const target = (servers || []).find(server => String(server?.id || '') === OUTBOUND_SERVER_ID);
+  if (!target) return;
+  const since = Date.now() - DASHBOARD_LATENCY_WINDOW_HOURS * 60 * 60 * 1000;
+  try {
+    const points = await readOutboundHistory(db, OUTBOUND_SERVER_ID, since);
+    if (points.length > 0) target.outbound = { points };
+  } catch (error) {
+    if (!/no such table/i.test(String(error?.message || error))) {
+      console.warn('[Dashboard] outbound latency history skipped:', error?.message || error);
+    }
   }
 }
 
@@ -227,6 +243,7 @@ export async function handleServersAPI(request, env, sys) {
       : Promise.resolve(new Map())
   ]);
   attachLatencyHistoryToServers(results, latencyHistory);
+  await attachOutboundLatency(env.DB, results);
   
   const now = Date.now();
   let globalOnline = 0;
