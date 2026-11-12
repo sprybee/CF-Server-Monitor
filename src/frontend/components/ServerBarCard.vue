@@ -113,6 +113,8 @@
       :format-ping-value="formatPingValue"
       :format-loss-value="formatLossValue"
       :is-ping-valid="isPingValid"
+      :outbound-rows="outboundRows"
+      :outbound-caption="outboundCaption"
     />
   </router-link>
 </template>
@@ -170,6 +172,8 @@ const {
   hasPingData,
   threeNetDetails,
   hasThreeNetDetails,
+  outboundRows,
+  outboundCaption,
   getPublicAssetUrl,
   formatBytes
 } = useServerCardData(props)

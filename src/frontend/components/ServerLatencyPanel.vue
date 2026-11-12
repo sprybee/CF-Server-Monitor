@@ -52,6 +52,25 @@
       </div>
     </template>
   </div>
+  <div v-if="outboundRows.length" class="outbound-latency">
+    <div class="outbound-latency-caption">{{ outboundCaption }}</div>
+    <div class="three-net-row" v-for="row in outboundRows" :key="row.key">
+      <div class="three-net-head">
+        <span class="three-net-name">{{ row.label }}</span>
+        <strong class="three-net-value" :style="{ color: getPingColor(row.latestPing) }">{{ formatPingValue(row.latestPing) }}</strong>
+      </div>
+      <div class="three-net-buckets">
+        <span
+          v-for="(point, index) in row.points"
+          :key="index"
+          class="three-net-bucket"
+          :data-tooltip="point.pingTooltip"
+        >
+          <span class="three-net-bucket-fill" :style="{ height: point.pingHeight + '%', background: point.pingColor, opacity: point.pingOpacity }"></span>
+        </span>
+      </div>
+    </div>
+  </div>
 </template>
 
 <script setup>
@@ -104,6 +123,14 @@ defineProps({
   isPingValid: {
     type: Function,
     required: true
+  },
+  outboundRows: {
+    type: Array,
+    default: () => []
+  },
+  outboundCaption: {
+    type: String,
+    default: ''
   }
 })
 </script>

@@ -388,8 +388,7 @@ export const fetchServerDetail = async (id, apiIndex = 0) => {
   return result.data
 }
 
-export const fetchAllHistory = async (id, hours, apiIndex = 0) => {
-  const result = await http.getByIndex(`/api/history/all?id=${id}&hours=${hours}`, apiIndex, { autoRedirect: false })
+const readHistoryResponse = (result) => {
   if (result.error) {
     const error = new Error(result.error)
     error.code = result.code
@@ -398,6 +397,16 @@ export const fetchAllHistory = async (id, hours, apiIndex = 0) => {
     throw error
   }
   return Array.isArray(result.data) ? result.data : []
+}
+
+export const fetchAllHistory = async (id, hours, apiIndex = 0) => {
+  const result = await http.getByIndex(`/api/history/all?id=${id}&hours=${hours}`, apiIndex, { autoRedirect: false })
+  return readHistoryResponse(result)
+}
+
+export const fetchOutboundHistory = async (id, hours, apiIndex = 0) => {
+  const result = await http.getByIndex(`/api/history/outbound?id=${id}&hours=${hours}`, apiIndex, { autoRedirect: false })
+  return readHistoryResponse(result)
 }
 
 export const adminApi = async (data, apiIndex = 0) => {
