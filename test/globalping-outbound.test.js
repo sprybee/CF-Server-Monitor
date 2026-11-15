@@ -129,6 +129,8 @@ test('five-minute gate follows the cron timestamp and skips other minutes', () =
 });
 
 test('measurement locations stay on mainland China ASNs', () => {
+  assert.equal(OUTBOUND_TARGET, '23.26.251.45');
+  assert.equal(OUTBOUND_SERVER_ID, '74a08d8d-19d7-4b7a-91bc-11506f6027f7');
   const body = buildMeasurementRequest(OUTBOUND_CARRIERS.map(item => ({ asn: item.asns[0] })));
   assertMainlandRequest(body);
   assert.equal(body.locations.length, 3);
@@ -339,7 +341,7 @@ test('history API returns outbound points and private mode still denies anonymou
     const db = await miniflare.getD1Database('DB');
     await seedServer(db, false);
     const env = { API_SECRET: 'test-secret', DB: db };
-    const createdAt = Date.UTC(2026, 10, 12, 1, 0, 0);
+    const createdAt = Date.now() - 60 * 60 * 1000;
     await saveOutboundPoints(db, OUTBOUND_SERVER_ID, [{
       measurement_id: 'hist-1',
       created_at: createdAt,
