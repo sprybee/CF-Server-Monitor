@@ -136,7 +136,7 @@ export async function clearHistory(db) {
 
     await db.prepare(`DROP TABLE IF EXISTS metrics_history_old`).run();
     debug('✅ 已删除 metrics_history_old 表');
-    
+
     dbInitialized = false;
     
     await initDatabase(db);

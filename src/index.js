@@ -1,4 +1,6 @@
 import { initDatabase, weeklyCleanup, getMetricsHistory, clearHistory } from './database/schema.js';
+import { getOutboundHistory } from './database/globalpingStore.js';
+import { isGlobalpingOutboundSlot, runGlobalpingOutbound } from './services/globalpingOutbound.js';
 import { checkOfflineNodes, checkExpiringServers, checkResourceAlerts } from './services/notification.js';
 import { updateDatabase } from './database/updateDatabase.js';
 import { handleAdminAPI } from './handlers/admin.js';
@@ -101,32 +103,40 @@ async function isTurnstileVerified(request, env, sys) {
   }
 }
 
-async function fetchHistoryData(env, request, id, hours, columns, sys = null) {
-  if (!id) return createBadRequestResponse('Missing ID');
+const HISTORY_ALLOWED_HOURS = [0.167, 0.5, 1, 6, 12, 24, 48, 96, 168];
 
-  const ALLOWED_HOURS = [0.167, 0.5, 1, 6, 12, 24, 48, 96, 168];
-  if (!ALLOWED_HOURS.includes(hours)) {
-    return createBadRequestResponse('Invalid hours parameter');
+async function authorizeHistoryRead(env, request, id, hours, sys = null) {
+  if (!id) return { response: createBadRequestResponse('Missing ID') };
+  if (!HISTORY_ALLOWED_HOURS.includes(hours)) {
+    return { response: createBadRequestResponse('Invalid hours parameter') };
   }
-  
+
   if (!sys) {
     sys = await loadSiteSettings(env.DB);
   }
   const isLoggedIn = await checkAuth(request, env, sys);
-  
+
   if (sys.is_public !== 'true' && !isLoggedIn) {
-    return simpleAuthResponse();
+    return { response: simpleAuthResponse() };
   }
-  
+
   if (hours > 24 && !isLoggedIn) {
-    return createUnauthorizedResponse();
+    return { response: createUnauthorizedResponse() };
   }
-  
+
   const server = await getServerDetail(env.DB, id, isLoggedIn);
-  if (!server) return createNotFoundResponse();
-  
+  if (!server) return { response: createNotFoundResponse() };
+
+  return { server, isLoggedIn, sys, hours: Math.min(hours, 168) };
+}
+
+async function fetchHistoryData(env, request, id, hours, columns, sys = null) {
+  const auth = await authorizeHistoryRead(env, request, id, hours, sys);
+  if (auth.response) return auth.response;
+  sys = auth.sys;
+
   // 最多查询7天数据
-  const clampedHours = Math.min(hours, 168);
+  const clampedHours = auth.hours;
   const cacheDuration = getCacheDuration(clampedHours);
   const longHistoryPoints = clampedHours > 1
     ? Number(normalizeLongHistoryPoints(sys.long_history_points))
@@ -147,7 +157,7 @@ async function fetchHistoryData(env, request, id, hours, columns, sys = null) {
       id,
       clampedHours,
       columns,
-      server,
+      auth.server,
       longHistoryPoints
     );
   } catch (e) {
@@ -179,6 +189,15 @@ async function fetchHistoryData(env, request, id, hours, columns, sys = null) {
   setMetricsHistoryCache(id, clampedHours, columns, sanitizedData, longHistoryPoints);
   
   return createSuccessResponse(sanitizedData, { 'X-Cache': 'MISS' });
+}
+
+async function fetchOutboundHistoryData(env, request, id, hours, sys = null) {
+  const auth = await authorizeHistoryRead(env, request, id, hours, sys);
+  if (auth.response) return auth.response;
+
+  const since = Date.now() - auth.hours * 60 * 60 * 1000;
+  const points = await getOutboundHistory(env.DB, id, since);
+  return createSuccessResponse(points);
 }
 
 export default {
@@ -408,6 +427,12 @@ export default {
         // 后续版本可以删掉region 字段，用于升级数据库提示
         return fetchHistoryData(env, request, id, hours, allColumns, sys);
       }},
+      { method: 'GET', path: '/api/history/outbound', handler: async () => {
+        await ensureSiteSettings();
+        const id = url.searchParams.get('id');
+        const hours = parseFloat(url.searchParams.get('hours') || '24');
+        return fetchOutboundHistoryData(env, request, id, hours, sys);
+      }},
       { method: 'POST', path: '/admin/api', handler: async () => {
         await ensureSiteSettings();
         return handleAdminAPI(request, env, sys, ensureFullSettings, ctx);
@@ -484,6 +509,15 @@ export default {
         debug('[Cron] 开始执行资源负载告警检测');
         await checkResourceAlerts(env, { siteSettings });
         debug('[Cron] 资源负载告警检测完成');
+      }
+      const slotTime = Number(event?.scheduledTime) > 0 ? Number(event.scheduledTime) : now.getTime();
+      if (isGlobalpingOutboundSlot(slotTime)) {
+        // Await the round. Fetch time is I/O, not the 10ms CPU budget, and each
+        // Globalping call has its own timeout. waitUntil would detach the D1
+        // writes from this attempt, so a frozen isolate could drop them.
+        debug('[Cron] 开始执行国内到马来西亚出站延迟探测');
+        await runGlobalpingOutbound(env, slotTime);
+        debug('[Cron] 国内到马来西亚出站延迟探测完成');
       }
     } else if (cron === '0 * * * *') {
       if (day === 0 && hour === 0) {
