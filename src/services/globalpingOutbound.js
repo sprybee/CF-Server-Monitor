@@ -10,7 +10,7 @@ import {
 } from '../database/globalpingStore.js';
 
 export const GLOBALPING_API = 'https://api.globalping.io/v1';
-export const OUTBOUND_TARGET = '168.93.198.110';
+export const OUTBOUND_TARGET = '23.26.251.45';
 export const OUTBOUND_SERVER_ID = '74a08d8d-19d7-4b7a-91bc-11506f6027f7';
 export const OUTBOUND_INTERVAL_MS = 5 * 60 * 1000;
 export const OUTBOUND_RETENTION_MS = 8 * 24 * 60 * 60 * 1000;
